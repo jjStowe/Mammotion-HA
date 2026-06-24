@@ -189,6 +189,45 @@
       "activity_mode": {
         "name": "Activity mode"
       },
+      "raw_sys_status": {
+        "name": "Raw system status"
+      },
+      "raw_sys_status_name": {
+        "name": "Raw system status name"
+      },
+      "raw_charge_state": {
+        "name": "Raw charge state"
+      },
+      "raw_position_type": {
+        "name": "Raw position type"
+      },
+      "raw_position_type_name": {
+        "name": "Raw position type name"
+      },
+      "raw_work_zone": {
+        "name": "Raw work zone"
+      },
+      "raw_mow_path_now_index": {
+        "name": "Raw mow path now index"
+      },
+      "raw_mow_path_start_index": {
+        "name": "Raw mow path start index"
+      },
+      "work_task_area_ids": {
+        "name": "Work task area IDs"
+      },
+      "work_task_area_statuses": {
+        "name": "Work task area statuses"
+      },
+      "last_report_age_seconds": {
+        "name": "Last report age"
+      },
+      "raw_device_event_identifier": {
+        "name": "Raw device event identifier"
+      },
+      "raw_status_property": {
+        "name": "Raw status property"
+      },
       "work_area": {
         "name": "Current location"
       },
@@ -253,6 +292,14 @@
           "LINE": "Waterline",
           "CUSTOM": "Custom"
         }
+      }
+    },
+    "binary_sensor": {
+      "charging": {
+        "name": "Charging"
+      },
+      "garage_access_needed": {
+        "name": "Garage access needed"
       }
     },
     "button": {

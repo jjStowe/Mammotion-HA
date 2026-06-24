@@ -1,10 +1,12 @@
 """Creates the sensor entities for the mower."""
 
+import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 from functools import partial
+from typing import Any
 
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.components.sensor import (
@@ -105,6 +107,81 @@ class MowerDataFormatter:
             return "Not set"
 
         return f"{MowerDataFormatter.format_time(start)} - {MowerDataFormatter.format_time(end)}"
+
+
+def _get_nested(value: Any, *path: str) -> Any:
+    """Return a nested attribute or mapping value without raising."""
+    current = value
+    for part in path:
+        if current is None:
+            return None
+        try:
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part)
+        except (AttributeError, TypeError):
+            return None
+    return current
+
+
+def _enum_name(value: Any) -> str | None:
+    """Return a stable string for enum-like values."""
+    if value is None:
+        return None
+    return str(getattr(value, "name", value))
+
+
+def _device_mode_name(sys_status: Any) -> str | None:
+    if sys_status is None:
+        return None
+    try:
+        return device_mode(sys_status)
+    except (TypeError, ValueError):
+        return str(sys_status)
+
+
+def _position_type_name(position_type: Any) -> str | None:
+    if position_type is None:
+        return None
+    try:
+        return PosType(position_type).name
+    except (TypeError, ValueError):
+        return str(position_type)
+
+
+def _work_task_area_ids(mower_data: MowingDevice) -> str:
+    ids = _get_nested(mower_data, "events", "work_tasks_event", "ids") or []
+    return ",".join(str(area_id) for area_id in ids)
+
+
+def _work_task_area_statuses(mower_data: MowingDevice) -> str:
+    area_map = (
+        _get_nested(mower_data, "events", "work_tasks_event", "hash_area_map") or {}
+    )
+    return json.dumps(
+        {str(area_hash): _enum_name(status) for area_hash, status in area_map.items()},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _last_report_age_seconds(
+    coordinator: MammotionReportUpdateCoordinator,
+) -> int | None:
+    handle = coordinator.manager.mower(coordinator.device_name)
+    last_report_at = getattr(handle, "last_report_at", None) if handle else None
+    if last_report_at is None:
+        return None
+
+    if isinstance(last_report_at, datetime):
+        age = datetime.now(last_report_at.tzinfo) - last_report_at
+        return max(0, int(age.total_seconds()))
+
+    if isinstance(last_report_at, (int, float)):
+        return max(0, int(datetime.now().timestamp() - last_report_at))
+
+    return None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -392,6 +469,84 @@ SENSOR_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
+        key="raw_sys_status",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "report_data", "dev", "sys_status"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_sys_status_name",
+        device_class=SensorDeviceClass.ENUM,
+        value_fn=lambda mower_data: _device_mode_name(
+            _get_nested(mower_data, "report_data", "dev", "sys_status")
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_charge_state",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "report_data", "dev", "charge_state"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_position_type",
+        value_fn=lambda mower_data: _get_nested(mower_data, "location", "position_type"),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_position_type_name",
+        device_class=SensorDeviceClass.ENUM,
+        value_fn=lambda mower_data: _position_type_name(
+            _get_nested(mower_data, "location", "position_type")
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_work_zone",
+        value_fn=lambda mower_data: _get_nested(mower_data, "mowing_state", "zone_hash"),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_mow_path_now_index",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "mowing_state", "mow_path_now_index"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_mow_path_start_index",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "mowing_state", "mow_path_start_index"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="work_task_area_ids",
+        value_fn=_work_task_area_ids,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="work_task_area_statuses",
+        value_fn=_work_task_area_statuses,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_device_event_identifier",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "device_event", "params", "identifier"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
+        key="raw_status_property",
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "status_properties", "params", "status", "value"
+        ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSensorEntityDescription(
         key="rtk_latitude",
         native_unit_of_measurement=DEGREE,
         value_fn=lambda mower_data: mower_data.location.RTK.latitude * 180.0 / math.pi,
@@ -543,6 +698,14 @@ WORK_SENSOR_TYPES: tuple[MammotionWorkSensorEntityDescription, ...] = (
         value_fn=lambda coordinator, mower_data: (
             "reported_online" if coordinator.mqtt_device_online else "reported_offline"
         ),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionWorkSensorEntityDescription(
+        key="last_report_age_seconds",
+        state_class=SensorStateClass.MEASUREMENT,
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        value_fn=lambda coordinator, mower_data: _last_report_age_seconds(coordinator),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )

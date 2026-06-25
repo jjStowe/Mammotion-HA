@@ -37,12 +37,11 @@ class MammotionBinarySensorEntityDescription(
     ) = None
 
 
-ACTIVE_GARAGE_ACCESS_MODES = {
-    "MODE_RETURNING",
+DEPARTING_GARAGE_ACCESS_MODES = {
     "MODE_WORKING",
     "MODE_MANUAL_MOWING",
-    "MODE_CHARGING_PAUSE",
 }
+RETURNING_GARAGE_ACCESS_MODES = {"MODE_RETURNING"}
 DOCKED_GARAGE_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 
 
@@ -100,30 +99,57 @@ def _is_docked_or_charging(values: dict[str, Any]) -> bool:
     )
 
 
+def _garage_access_phase(
+    entity: "MammotionBinarySensorEntity", values: dict[str, Any]
+) -> str:
+    """Return the current garage-access phase for attributes and logs."""
+    sys_status_name = values["sys_status_name"]
+    position_type_name = values["position_type_name"]
+    docked_or_charging = _is_docked_or_charging(values)
+
+    if sys_status_name in DEPARTING_GARAGE_ACCESS_MODES:
+        if position_type_name == "CHARGE_ON":
+            return "departing_dock"
+        if position_type_name is None:
+            if docked_or_charging or entity._was_docked_or_charging:
+                return "departing_dock"
+        return "away_from_dock"
+
+    if docked_or_charging:
+        return "docked"
+
+    if sys_status_name in RETURNING_GARAGE_ACCESS_MODES:
+        return "returning_to_dock"
+
+    if position_type_name not in (None, "CHARGE_ON"):
+        return "away_from_dock"
+
+    return "unknown"
+
+
 def _garage_access_needed(
     entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
 ) -> bool | None:
     values = _raw_garage_values(mower_data)
     sys_status_name = values["sys_status_name"]
-    position_type_name = values["position_type_name"]
     docked_or_charging = _is_docked_or_charging(values)
 
     if docked_or_charging:
         entity._was_docked_or_charging = True
 
-    if sys_status_name in ACTIVE_GARAGE_ACCESS_MODES:
-        return True
+    if sys_status_name in DEPARTING_GARAGE_ACCESS_MODES:
+        return _garage_access_phase(entity, values) == "departing_dock"
 
-    if docked_or_charging and sys_status_name in DOCKED_GARAGE_ACCESS_MODES:
+    if docked_or_charging:
         return False
 
-    if entity._was_docked_or_charging and position_type_name not in (
-        None,
-        "CHARGE_ON",
-    ):
+    if sys_status_name in RETURNING_GARAGE_ACCESS_MODES:
         return True
 
-    return None
+    if sys_status_name in DOCKED_GARAGE_ACCESS_MODES:
+        return False
+
+    return False
 
 
 def _source_hint(coordinator: MammotionBaseUpdateCoordinator) -> str:
@@ -159,6 +185,7 @@ def _garage_access_attributes(
     entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
 ) -> dict[str, Any]:
     values = _raw_garage_values(mower_data)
+    values["access_phase"] = _garage_access_phase(entity, values)
     values["source_hint"] = _source_hint(entity.coordinator)
     values["last_report_age_seconds"] = _last_report_age_seconds(entity.coordinator)
     return values
@@ -258,7 +285,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             "Garage access needed for %s changed to %s "
             "(sys_status=%s sys_status_name=%s charge_state=%s "
             "position_type=%s position_type_name=%s work_zone=%s "
-            "last_report_age_seconds=%s source_hint=%s)",
+            "access_phase=%s last_report_age_seconds=%s source_hint=%s)",
             self.coordinator.device_name,
             is_on,
             attrs["sys_status"],
@@ -267,6 +294,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             attrs["position_type"],
             attrs["position_type_name"],
             attrs["work_zone"],
+            attrs["access_phase"],
             attrs["last_report_age_seconds"],
             attrs["source_hint"],
         )

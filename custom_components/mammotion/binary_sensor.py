@@ -379,7 +379,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._garage_access_departure_grace_until = None
 
     @callback
-    def _expire_garage_access_departure_grace(self, now: datetime) -> None:
+def _expire_garage_access_departure_grace(self, _: datetime) -> None:
         """Expire the departure grace state and write the updated binary state."""
         self._garage_access_departure_grace_signature = None
         self._garage_access_departure_grace_until = None

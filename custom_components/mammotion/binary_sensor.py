@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,8 +14,9 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.constant.device_constant import PosType, device_mode
@@ -43,6 +45,7 @@ DEPARTING_GARAGE_ACCESS_MODES = {
 }
 RETURNING_GARAGE_ACCESS_MODES = {"MODE_RETURNING"}
 DOCKED_GARAGE_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
+DEPARTURE_GRACE_SECONDS = 90
 
 
 def _get_nested(value: Any, *path: str) -> Any:
@@ -99,6 +102,15 @@ def _is_docked_or_charging(values: dict[str, Any]) -> bool:
     )
 
 
+def _garage_access_signature(values: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        values["sys_status"],
+        values["charge_state"],
+        values["position_type"],
+        values["work_zone"],
+    )
+
+
 def _garage_access_phase(
     entity: "MammotionBinarySensorEntity", values: dict[str, Any]
 ) -> str:
@@ -108,11 +120,19 @@ def _garage_access_phase(
     docked_or_charging = _is_docked_or_charging(values)
 
     if sys_status_name in DEPARTING_GARAGE_ACCESS_MODES:
+        signature = _garage_access_signature(values)
+        if entity._garage_access_departure_grace_active(signature):
+            return "departing_dock_grace"
         if position_type_name == "CHARGE_ON":
             return "departing_dock"
         if position_type_name is None:
             if docked_or_charging or entity._was_docked_or_charging:
                 return "departing_dock"
+        if (
+            entity._was_docked_or_charging
+            and not entity._garage_access_departure_grace_used
+        ):
+            return "departing_dock_grace"
         return "away_from_dock"
 
     if docked_or_charging:
@@ -133,22 +153,33 @@ def _garage_access_needed(
     values = _raw_garage_values(mower_data)
     sys_status_name = values["sys_status_name"]
     docked_or_charging = _is_docked_or_charging(values)
+    signature = _garage_access_signature(values)
 
     if docked_or_charging:
         entity._was_docked_or_charging = True
+        entity._garage_access_departure_grace_used = False
 
     if sys_status_name in DEPARTING_GARAGE_ACCESS_MODES:
-        return _garage_access_phase(entity, values) == "departing_dock"
+        phase = _garage_access_phase(entity, values)
+        if phase in ("departing_dock", "departing_dock_grace"):
+            entity._start_garage_access_departure_grace(signature)
+            return True
+        entity._clear_garage_access_departure_grace()
+        return False
 
     if docked_or_charging:
+        entity._clear_garage_access_departure_grace()
         return False
 
     if sys_status_name in RETURNING_GARAGE_ACCESS_MODES:
+        entity._clear_garage_access_departure_grace()
         return True
 
     if sys_status_name in DOCKED_GARAGE_ACCESS_MODES:
+        entity._clear_garage_access_departure_grace()
         return False
 
+    entity._clear_garage_access_departure_grace()
     return False
 
 
@@ -229,6 +260,10 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
 
     entity_description: MammotionBinarySensorEntityDescription
     _was_docked_or_charging: bool
+    _garage_access_departure_grace_signature: tuple[Any, ...] | None
+    _garage_access_departure_grace_until: float | None
+    _garage_access_departure_grace_cancel: CALLBACK_TYPE | None
+    _garage_access_departure_grace_used: bool
     _garage_access_logged_initial_state: bool
     _garage_access_last_logged_state: bool | None
 
@@ -244,6 +279,10 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             entity_description.translation_key or entity_description.key
         )
         self._was_docked_or_charging = False
+        self._garage_access_departure_grace_signature = None
+        self._garage_access_departure_grace_until = None
+        self._garage_access_departure_grace_cancel = None
+        self._garage_access_departure_grace_used = False
         self._garage_access_logged_initial_state = False
         self._garage_access_last_logged_state = None
 
@@ -298,3 +337,52 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             attrs["last_report_age_seconds"],
             attrs["source_hint"],
         )
+
+    def _garage_access_departure_grace_active(
+        self,
+        signature: tuple[Any, ...],
+    ) -> bool:
+        """Return whether this report is inside the departure grace window."""
+        return (
+            self._garage_access_departure_grace_signature == signature
+            and self._garage_access_departure_grace_until is not None
+            and time.monotonic() < self._garage_access_departure_grace_until
+        )
+
+    def _start_garage_access_departure_grace(
+        self,
+        signature: tuple[Any, ...],
+    ) -> None:
+        """Hold the departure open signal briefly for first post-dock reports."""
+        if self._garage_access_departure_grace_active(signature):
+            return
+
+        self._clear_garage_access_departure_grace()
+        self._garage_access_departure_grace_signature = signature
+        self._garage_access_departure_grace_until = (
+            time.monotonic() + DEPARTURE_GRACE_SECONDS
+        )
+        self._garage_access_departure_grace_used = True
+        if self.hass is not None:
+            self._garage_access_departure_grace_cancel = async_call_later(
+                self.hass,
+                DEPARTURE_GRACE_SECONDS,
+                self._expire_garage_access_departure_grace,
+            )
+
+    def _clear_garage_access_departure_grace(self) -> None:
+        """Clear any pending departure grace timer."""
+        if self._garage_access_departure_grace_cancel is not None:
+            self._garage_access_departure_grace_cancel()
+            self._garage_access_departure_grace_cancel = None
+        self._garage_access_departure_grace_signature = None
+        self._garage_access_departure_grace_until = None
+
+    @callback
+    def _expire_garage_access_departure_grace(self, now: datetime) -> None:
+        """Expire the departure grace state and write the updated binary state."""
+        self._garage_access_departure_grace_signature = None
+        self._garage_access_departure_grace_until = None
+        self._garage_access_departure_grace_cancel = None
+        self._log_garage_access_transition()
+        self.async_write_ha_state()

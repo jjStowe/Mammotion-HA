@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -12,13 +13,14 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.constant.device_constant import PosType, device_mode
 
 from . import MammotionConfigEntry
+from .const import LOGGER
 from .coordinator import MammotionBaseUpdateCoordinator
 from .entity import MammotionBaseEntity
 
@@ -137,11 +139,28 @@ def _source_hint(coordinator: MammotionBaseUpdateCoordinator) -> str:
     return "unknown"
 
 
+def _last_report_age_seconds(coordinator: MammotionBaseUpdateCoordinator) -> int | None:
+    handle = coordinator.manager.mower(coordinator.device_name)
+    last_report_at = getattr(handle, "last_report_at", None) if handle else None
+    if last_report_at is None:
+        return None
+
+    if isinstance(last_report_at, datetime):
+        age = datetime.now(last_report_at.tzinfo) - last_report_at
+        return max(0, int(age.total_seconds()))
+
+    if isinstance(last_report_at, (int, float)):
+        return max(0, int(datetime.now().timestamp() - last_report_at))
+
+    return None
+
+
 def _garage_access_attributes(
     entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
 ) -> dict[str, Any]:
     values = _raw_garage_values(mower_data)
     values["source_hint"] = _source_hint(entity.coordinator)
+    values["last_report_age_seconds"] = _last_report_age_seconds(entity.coordinator)
     return values
 
 
@@ -159,7 +178,6 @@ BINARY_SENSORS: tuple[MammotionBinarySensorEntityDescription, ...] = (
         is_on_fn=_garage_access_needed,
         extra_attrs_fn=_garage_access_attributes,
         entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
     ),
 )
 
@@ -184,6 +202,8 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
 
     entity_description: MammotionBinarySensorEntityDescription
     _was_docked_or_charging: bool
+    _garage_access_logged_initial_state: bool
+    _garage_access_last_logged_state: bool | None
 
     def __init__(
         self,
@@ -197,6 +217,8 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             entity_description.translation_key or entity_description.key
         )
         self._was_docked_or_charging = False
+        self._garage_access_logged_initial_state = False
+        self._garage_access_last_logged_state = None
 
     @property
     def is_on(self) -> bool | None:
@@ -209,3 +231,42 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         if self.entity_description.extra_attrs_fn is None:
             return None
         return self.entity_description.extra_attrs_fn(self, self.coordinator.data)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Log garage access transitions before writing updated HA state."""
+        if self.entity_description.key == "garage_access_needed":
+            self._log_garage_access_transition()
+        super()._handle_coordinator_update()
+
+    def _log_garage_access_transition(self) -> None:
+        """Write an audit line when garage access state changes."""
+        if self.coordinator.data is None:
+            return
+
+        is_on = self.is_on
+        if (
+            self._garage_access_logged_initial_state
+            and is_on == self._garage_access_last_logged_state
+        ):
+            return
+
+        self._garage_access_logged_initial_state = True
+        self._garage_access_last_logged_state = is_on
+        attrs = _garage_access_attributes(self, self.coordinator.data)
+        LOGGER.info(
+            "Garage access needed for %s changed to %s "
+            "(sys_status=%s sys_status_name=%s charge_state=%s "
+            "position_type=%s position_type_name=%s work_zone=%s "
+            "last_report_age_seconds=%s source_hint=%s)",
+            self.coordinator.device_name,
+            is_on,
+            attrs["sys_status"],
+            attrs["sys_status_name"],
+            attrs["charge_state"],
+            attrs["position_type"],
+            attrs["position_type_name"],
+            attrs["work_zone"],
+            attrs["last_report_age_seconds"],
+            attrs["source_hint"],
+        )

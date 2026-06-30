@@ -387,8 +387,8 @@
       "charging": {
         "name": "Charging"
       },
-      "garage_access_needed": {
-        "name": "Garage access needed"
+      "dock_access_requested": {
+        "name": "Dock access requested"
       }
     },
     "button": {

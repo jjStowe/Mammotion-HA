@@ -45,8 +45,6 @@ DEPARTING_DOCK_ACCESS_MODES = {
 RETURNING_DOCK_ACCESS_MODES = {"MODE_RETURNING", "MODE_CHARGING_PAUSE"}
 DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 DEPARTURE_GRACE_SECONDS = 90
-DOCK_ACCESS_MIN_REQUEST_SECONDS = 90
-DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 20
 
 
 def _get_nested(value: Any, *path: str) -> Any:
@@ -151,14 +149,6 @@ def _dock_access_phase(
 def _dock_access_requested(
     entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
 ) -> bool | None:
-    return entity._apply_dock_access_hysteresis(
-        _dock_access_requested_raw(entity, mower_data)
-    )
-
-
-def _dock_access_requested_raw(
-    entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
-) -> bool:
     values = _raw_dock_access_values(mower_data)
     sys_status_name = values["sys_status_name"]
     docked_or_charging = _is_docked_or_charging(values)
@@ -273,9 +263,6 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     _dock_access_departure_grace_used: bool
     _dock_access_logged_initial_state: bool
     _dock_access_last_logged_state: bool | None
-    _dock_access_requested_state: bool | None
-    _dock_access_state_changed_at: float | None
-    _dock_access_close_pending_since: float | None
 
     def __init__(
         self,
@@ -294,9 +281,6 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._dock_access_departure_grace_used = False
         self._dock_access_logged_initial_state = False
         self._dock_access_last_logged_state = None
-        self._dock_access_requested_state = None
-        self._dock_access_state_changed_at = None
-        self._dock_access_close_pending_since = None
 
     @property
     def is_on(self) -> bool | None:
@@ -380,41 +364,3 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         """Clear any pending departure grace timer."""
         self._dock_access_departure_grace_signature = None
         self._dock_access_departure_grace_until = None
-
-    def _apply_dock_access_hysteresis(self, requested: bool) -> bool:
-        """Hold request-on long enough to ignore noisy transition frames."""
-        now = time.monotonic()
-        if self._dock_access_requested_state is None:
-            self._dock_access_requested_state = requested
-            self._dock_access_state_changed_at = now
-            self._dock_access_close_pending_since = None
-            return requested
-
-        if requested == self._dock_access_requested_state:
-            if requested:
-                self._dock_access_close_pending_since = None
-            return self._dock_access_requested_state
-
-        if self._dock_access_requested_state and not requested:
-            if self._dock_access_close_pending_since is None:
-                self._dock_access_close_pending_since = now
-
-            changed_at = self._dock_access_state_changed_at
-            if (
-                changed_at is not None
-                and now - changed_at < DOCK_ACCESS_MIN_REQUEST_SECONDS
-            ):
-                return True
-
-            if (
-                now - self._dock_access_close_pending_since
-                < DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS
-            ):
-                return True
-
-        if requested:
-            self._dock_access_close_pending_since = None
-
-        self._dock_access_requested_state = requested
-        self._dock_access_state_changed_at = now
-        return requested

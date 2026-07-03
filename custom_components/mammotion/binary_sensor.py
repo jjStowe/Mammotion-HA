@@ -134,11 +134,16 @@ def _dock_access_phase(
             return "departing_dock_grace"
         return "away_from_dock"
 
-    if docked_or_charging:
-        return "docked"
-
     if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
         return "returning_to_dock"
+
+    if entity._dock_access_return_latched:
+        if docked_or_charging and sys_status_name in DOCKED_DOCK_ACCESS_MODES:
+            return "docked"
+        return "returning_to_dock_latched"
+
+    if docked_or_charging:
+        return "docked"
 
     if position_type_name not in (None, "CHARGE_ON"):
         return "away_from_dock"
@@ -166,13 +171,22 @@ def _dock_access_requested(
         entity._clear_dock_access_departure_grace()
         return False
 
+    if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
+        entity._dock_access_return_latched = True
+        entity._clear_dock_access_departure_grace()
+        return True
+
+    if entity._dock_access_return_latched:
+        if docked_or_charging and sys_status_name in DOCKED_DOCK_ACCESS_MODES:
+            entity._dock_access_return_latched = False
+            entity._clear_dock_access_departure_grace()
+            return False
+        entity._clear_dock_access_departure_grace()
+        return True
+
     if docked_or_charging:
         entity._clear_dock_access_departure_grace()
         return False
-
-    if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
-        entity._clear_dock_access_departure_grace()
-        return True
 
     if sys_status_name in DOCKED_DOCK_ACCESS_MODES:
         entity._clear_dock_access_departure_grace()
@@ -216,6 +230,7 @@ def _dock_access_attributes(
 ) -> dict[str, Any]:
     values = _raw_dock_access_values(mower_data)
     values["access_phase"] = _dock_access_phase(entity, values)
+    values["return_latched"] = entity._dock_access_return_latched
     values["source_hint"] = _source_hint(entity.coordinator)
     values["last_report_age_seconds"] = _last_report_age_seconds(entity.coordinator)
     return values
@@ -261,6 +276,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     _dock_access_departure_grace_signature: tuple[Any, ...] | None
     _dock_access_departure_grace_until: float | None
     _dock_access_departure_grace_used: bool
+    _dock_access_return_latched: bool
     _dock_access_logged_initial_state: bool
     _dock_access_last_logged_state: bool | None
 
@@ -279,6 +295,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._dock_access_departure_grace_signature = None
         self._dock_access_departure_grace_until = None
         self._dock_access_departure_grace_used = False
+        self._dock_access_return_latched = False
         self._dock_access_logged_initial_state = False
         self._dock_access_last_logged_state = None
 
@@ -320,7 +337,8 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             "Dock access requested for %s changed to %s "
             "(sys_status=%s sys_status_name=%s charge_state=%s "
             "position_type=%s position_type_name=%s work_zone=%s "
-            "access_phase=%s last_report_age_seconds=%s source_hint=%s)",
+            "access_phase=%s return_latched=%s "
+            "last_report_age_seconds=%s source_hint=%s)",
             self.coordinator.device_name,
             is_on,
             attrs["sys_status"],
@@ -330,6 +348,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             attrs["position_type_name"],
             attrs["work_zone"],
             attrs["access_phase"],
+            attrs["return_latched"],
             attrs["last_report_age_seconds"],
             attrs["source_hint"],
         )

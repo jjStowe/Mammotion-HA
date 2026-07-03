@@ -150,6 +150,17 @@ def _position_type_name(position_type: Any) -> str | None:
         return str(position_type)
 
 
+def _vio_state_name(vio_state: Any) -> str | None:
+    if vio_state is None:
+        return None
+    if name := getattr(vio_state, "name", None):
+        return str(name)
+    for state in VioState:
+        if getattr(state, "value", None) == vio_state:
+            return state.name
+    return "SIGNAL_UNKNOWN"
+
+
 def _work_task_area_ids(mower_data: MowingDevice) -> str:
     ids = _get_nested(mower_data, "events", "work_tasks_event", "ids") or []
     return ",".join(str(area_id) for area_id in ids)
@@ -252,9 +263,9 @@ LUBA_2_YUKA_ONLY_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         state_class=None,
         device_class=SensorDeviceClass.ENUM,
         native_unit_of_measurement=None,
-        value_fn=lambda mower_data: VioState(
+        value_fn=lambda mower_data: _vio_state_name(
             mower_data.report_data.vision_info.vio_state
-        ).name,
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(

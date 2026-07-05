@@ -47,6 +47,7 @@ DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 DEPARTURE_GRACE_SECONDS = 90
 DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
 DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
+CHARGING_PAUSE_MODE = "MODE_CHARGING_PAUSE"
 
 
 def _get_nested(value: Any, *path: str) -> Any:
@@ -136,6 +137,9 @@ def _dock_access_phase(
             return "departing_dock_grace"
         return "away_from_dock"
 
+    if sys_status_name == CHARGING_PAUSE_MODE and docked_or_charging:
+        return "docked_charging_pause"
+
     if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
         return "returning_to_dock"
 
@@ -170,6 +174,11 @@ def _dock_access_requested(
         if phase in ("departing_dock", "departing_dock_grace"):
             entity._start_dock_access_departure_grace(signature)
             return True
+        entity._clear_dock_access_departure_grace()
+        return False
+
+    if sys_status_name == CHARGING_PAUSE_MODE and docked_or_charging:
+        entity._dock_access_return_latched = False
         entity._clear_dock_access_departure_grace()
         return False
 

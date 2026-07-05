@@ -45,6 +45,8 @@ DEPARTING_DOCK_ACCESS_MODES = {
 RETURNING_DOCK_ACCESS_MODES = {"MODE_RETURNING", "MODE_CHARGING_PAUSE"}
 DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 DEPARTURE_GRACE_SECONDS = 90
+DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
+DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
 
 
 def _get_nested(value: Any, *path: str) -> Any:
@@ -277,6 +279,9 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     _dock_access_departure_grace_until: float | None
     _dock_access_departure_grace_used: bool
     _dock_access_return_latched: bool
+    _dock_access_state: bool | None
+    _dock_access_state_changed_at: float | None
+    _dock_access_close_pending_since: float | None
     _dock_access_logged_initial_state: bool
     _dock_access_last_logged_state: bool | None
 
@@ -296,12 +301,19 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._dock_access_departure_grace_until = None
         self._dock_access_departure_grace_used = False
         self._dock_access_return_latched = False
+        self._dock_access_state = None
+        self._dock_access_state_changed_at = None
+        self._dock_access_close_pending_since = None
         self._dock_access_logged_initial_state = False
         self._dock_access_last_logged_state = None
 
     @property
     def is_on(self) -> bool | None:
         """Return true if the binary sensor is on."""
+        if self.entity_description.key == "dock_access_requested":
+            if self._dock_access_state is None and self.coordinator.data is not None:
+                self._update_dock_access_state()
+            return self._dock_access_state
         return self.entity_description.is_on_fn(self, self.coordinator.data)
 
     @property
@@ -315,8 +327,51 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     def _handle_coordinator_update(self) -> None:
         """Log dock access transitions before writing updated HA state."""
         if self.entity_description.key == "dock_access_requested":
+            self._update_dock_access_state()
             self._log_dock_access_transition()
         super()._handle_coordinator_update()
+
+    def _update_dock_access_state(self) -> None:
+        """Update the cached dock access state once per coordinator update."""
+        if self.coordinator.data is None:
+            self._dock_access_state = None
+            self._dock_access_state_changed_at = None
+            self._dock_access_close_pending_since = None
+            return
+        requested = self.entity_description.is_on_fn(self, self.coordinator.data)
+        now = time.monotonic()
+
+        if self._dock_access_state is None:
+            self._dock_access_state = requested
+            self._dock_access_state_changed_at = now
+            self._dock_access_close_pending_since = None
+            return
+
+        if requested == self._dock_access_state:
+            self._dock_access_close_pending_since = None
+            return
+
+        if self._dock_access_state and not requested:
+            if self._dock_access_close_pending_since is None:
+                self._dock_access_close_pending_since = now
+            changed_at = self._dock_access_state_changed_at
+            if (
+                changed_at is not None
+                and now - changed_at < DOCK_ACCESS_MIN_REQUEST_SECONDS
+            ):
+                return
+            if (
+                now - self._dock_access_close_pending_since
+                < DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS
+            ):
+                return
+
+        if requested:
+            self._dock_access_close_pending_since = None
+        self._dock_access_state = requested
+        self._dock_access_state_changed_at = now
+        if not requested:
+            self._dock_access_close_pending_since = None
 
     def _log_dock_access_transition(self) -> None:
         """Write an audit line when dock access state changes."""

@@ -14,8 +14,9 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.constant.device_constant import PosType, device_mode
@@ -47,6 +48,7 @@ DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 DEPARTURE_GRACE_SECONDS = 90
 DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
 DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
+RETURN_LATCH_DOCKED_STABLE_SECONDS = 20
 CHARGING_PAUSE_MODE = "MODE_CHARGING_PAUSE"
 
 
@@ -138,14 +140,31 @@ def _dock_access_phase(
         return "away_from_dock"
 
     if sys_status_name == CHARGING_PAUSE_MODE and docked_or_charging:
-        return "docked_charging_pause"
+        if (
+            entity._dock_access_return_latch_satisfied
+            or (
+                not entity._dock_access_return_latched
+                and entity._dock_access_state is not True
+            )
+        ):
+            return "docked_charging_pause"
+        return "charging_pause_docked_pending_close"
 
     if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
+        if docked_or_charging:
+            if entity._dock_access_return_latch_satisfied:
+                return "docked"
+            return "returning_docked_pending_close"
         return "returning_to_dock"
 
     if entity._dock_access_return_latched:
-        if docked_or_charging and sys_status_name in DOCKED_DOCK_ACCESS_MODES:
-            return "docked"
+        if docked_or_charging:
+            if (
+                sys_status_name in DOCKED_DOCK_ACCESS_MODES
+                or entity._dock_access_return_latch_satisfied
+            ):
+                return "docked"
+            return "returning_docked_pending_close"
         return "returning_to_dock_latched"
 
     if docked_or_charging:
@@ -168,8 +187,12 @@ def _dock_access_requested(
     if docked_or_charging:
         entity._was_docked_or_charging = True
         entity._dock_access_departure_grace_used = False
+    else:
+        entity._dock_access_return_latch_satisfied = False
+        entity._dock_access_return_latched_docked_since = None
 
     if sys_status_name in DEPARTING_DOCK_ACCESS_MODES:
+        entity._dock_access_return_latch_satisfied = False
         phase = _dock_access_phase(entity, values)
         if phase in ("departing_dock", "departing_dock_grace"):
             entity._start_dock_access_departure_grace(signature)
@@ -177,21 +200,27 @@ def _dock_access_requested(
         entity._clear_dock_access_departure_grace()
         return False
 
-    if sys_status_name == CHARGING_PAUSE_MODE and docked_or_charging:
-        entity._dock_access_return_latched = False
-        entity._clear_dock_access_departure_grace()
-        return False
-
     if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
-        entity._dock_access_return_latched = True
         entity._clear_dock_access_departure_grace()
-        return True
+        if docked_or_charging and entity._dock_access_return_latch_satisfied:
+            entity._dock_access_return_latched = False
+            return False
+        if (
+            docked_or_charging
+            and not entity._dock_access_return_latched
+            and entity._dock_access_state is not True
+        ):
+            entity._dock_access_return_latch_satisfied = True
+            return False
+        entity._dock_access_return_latched = True
+        return entity._dock_access_requested_for_return_latch(docked_or_charging)
 
     if entity._dock_access_return_latched:
         if docked_or_charging and sys_status_name in DOCKED_DOCK_ACCESS_MODES:
-            entity._dock_access_return_latched = False
-            entity._clear_dock_access_departure_grace()
-            return False
+            return entity._satisfy_dock_access_return_latch()
+        if docked_or_charging:
+            return entity._dock_access_requested_for_return_latch(docked_or_charging)
+        entity._dock_access_return_latched_docked_since = None
         entity._clear_dock_access_departure_grace()
         return True
 
@@ -242,6 +271,13 @@ def _dock_access_attributes(
     values = _raw_dock_access_values(mower_data)
     values["access_phase"] = _dock_access_phase(entity, values)
     values["return_latched"] = entity._dock_access_return_latched
+    values["return_latch_satisfied"] = entity._dock_access_return_latch_satisfied
+    docked_since = entity._dock_access_return_latched_docked_since
+    values["return_latched_docked_seconds"] = (
+        None
+        if docked_since is None
+        else max(0, int(time.monotonic() - docked_since))
+    )
     values["source_hint"] = _source_hint(entity.coordinator)
     values["last_report_age_seconds"] = _last_report_age_seconds(entity.coordinator)
     return values
@@ -288,9 +324,12 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     _dock_access_departure_grace_until: float | None
     _dock_access_departure_grace_used: bool
     _dock_access_return_latched: bool
+    _dock_access_return_latch_satisfied: bool
+    _dock_access_return_latched_docked_since: float | None
     _dock_access_state: bool | None
     _dock_access_state_changed_at: float | None
     _dock_access_close_pending_since: float | None
+    _dock_access_reevaluate_cancel: CALLBACK_TYPE | None
     _dock_access_logged_initial_state: bool
     _dock_access_last_logged_state: bool | None
 
@@ -310,11 +349,19 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._dock_access_departure_grace_until = None
         self._dock_access_departure_grace_used = False
         self._dock_access_return_latched = False
+        self._dock_access_return_latch_satisfied = False
+        self._dock_access_return_latched_docked_since = None
         self._dock_access_state = None
         self._dock_access_state_changed_at = None
         self._dock_access_close_pending_since = None
+        self._dock_access_reevaluate_cancel = None
         self._dock_access_logged_initial_state = False
         self._dock_access_last_logged_state = None
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel pending dock access timers before removal."""
+        self._cancel_dock_access_reevaluation()
+        await super().async_will_remove_from_hass()
 
     @property
     def is_on(self) -> bool | None:
@@ -368,19 +415,28 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
                 changed_at is not None
                 and now - changed_at < DOCK_ACCESS_MIN_REQUEST_SECONDS
             ):
+                self._schedule_dock_access_reevaluation(
+                    DOCK_ACCESS_MIN_REQUEST_SECONDS - (now - changed_at)
+                )
                 return
             if (
                 now - self._dock_access_close_pending_since
                 < DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS
             ):
+                self._schedule_dock_access_reevaluation(
+                    DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS
+                    - (now - self._dock_access_close_pending_since)
+                )
                 return
 
         if requested:
             self._dock_access_close_pending_since = None
+            self._cancel_dock_access_reevaluation()
         self._dock_access_state = requested
         self._dock_access_state_changed_at = now
         if not requested:
             self._dock_access_close_pending_since = None
+            self._cancel_dock_access_reevaluation()
 
     def _log_dock_access_transition(self) -> None:
         """Write an audit line when dock access state changes."""
@@ -401,7 +457,8 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             "Dock access requested for %s changed to %s "
             "(sys_status=%s sys_status_name=%s charge_state=%s "
             "position_type=%s position_type_name=%s work_zone=%s "
-            "access_phase=%s return_latched=%s "
+            "access_phase=%s return_latched=%s return_latch_satisfied=%s "
+            "return_latched_docked_seconds=%s "
             "last_report_age_seconds=%s source_hint=%s)",
             self.coordinator.device_name,
             is_on,
@@ -413,6 +470,8 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             attrs["work_zone"],
             attrs["access_phase"],
             attrs["return_latched"],
+            attrs["return_latch_satisfied"],
+            attrs["return_latched_docked_seconds"],
             attrs["last_report_age_seconds"],
             attrs["source_hint"],
         )
@@ -447,3 +506,65 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         """Clear any pending departure grace timer."""
         self._dock_access_departure_grace_signature = None
         self._dock_access_departure_grace_until = None
+
+    def _dock_access_requested_for_return_latch(self, docked_or_charging: bool) -> bool:
+        """Hold return access until docked evidence is stable enough to close."""
+        if not docked_or_charging:
+            self._dock_access_return_latched_docked_since = None
+            return True
+
+        now = time.monotonic()
+        if self._dock_access_return_latched_docked_since is None:
+            self._dock_access_return_latched_docked_since = now
+            self._schedule_dock_access_reevaluation(
+                RETURN_LATCH_DOCKED_STABLE_SECONDS
+            )
+            return True
+
+        if (
+            now - self._dock_access_return_latched_docked_since
+            < RETURN_LATCH_DOCKED_STABLE_SECONDS
+        ):
+            self._schedule_dock_access_reevaluation(
+                RETURN_LATCH_DOCKED_STABLE_SECONDS
+                - (now - self._dock_access_return_latched_docked_since)
+            )
+            return True
+
+        return self._satisfy_dock_access_return_latch()
+
+    def _satisfy_dock_access_return_latch(self) -> bool:
+        """Mark the return latch closed for the current docked period."""
+        self._dock_access_return_latched = False
+        self._dock_access_return_latch_satisfied = True
+        self._clear_dock_access_departure_grace()
+        return False
+
+    def _schedule_dock_access_reevaluation(self, delay: float) -> None:
+        """Schedule a cached-state reevaluation after a hold timer expires."""
+        if self.entity_description.key != "dock_access_requested":
+            return
+        if self._dock_access_reevaluate_cancel is not None:
+            return
+        self._dock_access_reevaluate_cancel = async_call_later(
+            self.hass,
+            max(0, delay),
+            self._async_dock_access_reevaluate,
+        )
+
+    def _cancel_dock_access_reevaluation(self) -> None:
+        """Cancel a pending dock access reevaluation timer."""
+        if self._dock_access_reevaluate_cancel is None:
+            return
+        self._dock_access_reevaluate_cancel()
+        self._dock_access_reevaluate_cancel = None
+
+    @callback
+    def _async_dock_access_reevaluate(self, _: datetime) -> None:
+        """Reevaluate dock access using the latest cached coordinator data."""
+        self._dock_access_reevaluate_cancel = None
+        if self.coordinator.data is None:
+            return
+        self._update_dock_access_state()
+        self._log_dock_access_transition()
+        self.async_write_ha_state()

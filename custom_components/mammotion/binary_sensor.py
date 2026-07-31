@@ -45,6 +45,8 @@ DEPARTING_DOCK_ACCESS_MODES = {
 }
 RETURNING_DOCK_ACCESS_MODES = {"MODE_RETURNING", "MODE_CHARGING_PAUSE"}
 DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
+TRUSTED_DOCK_ACCESS_MODES = RETURNING_DOCK_ACCESS_MODES | DOCKED_DOCK_ACCESS_MODES
+RECENT_DOCKED_DEPARTURE_SECONDS = 300
 DEPARTURE_GRACE_SECONDS = 90
 DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
 DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
@@ -106,6 +108,19 @@ def _is_docked_or_charging(values: dict[str, Any]) -> bool:
     )
 
 
+def _is_trusted_docked_or_charging(
+    entity: "MammotionBinarySensorEntity",
+    values: dict[str, Any],
+) -> bool:
+    if not _is_docked_or_charging(values):
+        return False
+
+    return (
+        values["sys_status_name"] in TRUSTED_DOCK_ACCESS_MODES
+        or entity._dock_access_state is True
+    )
+
+
 def _dock_access_signature(values: dict[str, Any]) -> tuple[Any, ...]:
     return (
         values["sys_status"],
@@ -122,18 +137,30 @@ def _dock_access_phase(
     sys_status_name = values["sys_status_name"]
     position_type_name = values["position_type_name"]
     docked_or_charging = _is_docked_or_charging(values)
+    recently_docked_or_charging = entity._dock_access_recently_docked_or_charging()
+    departure_available = (
+        not entity._dock_access_departure_grace_used
+        or entity._dock_access_state is True
+    )
 
     if sys_status_name in DEPARTING_DOCK_ACCESS_MODES:
         signature = _dock_access_signature(values)
         if entity._dock_access_departure_grace_active(signature):
             return "departing_dock_grace"
-        if position_type_name == "CHARGE_ON":
+        if (
+            position_type_name == "CHARGE_ON"
+            and recently_docked_or_charging
+            and departure_available
+        ):
             return "departing_dock"
         if position_type_name is None:
-            if docked_or_charging or entity._was_docked_or_charging:
+            if departure_available and (
+                _is_trusted_docked_or_charging(entity, values)
+                or recently_docked_or_charging
+            ):
                 return "departing_dock"
         if (
-            entity._was_docked_or_charging
+            recently_docked_or_charging
             and not entity._dock_access_departure_grace_used
         ):
             return "departing_dock_grace"
@@ -182,10 +209,11 @@ def _dock_access_requested(
     values = _raw_dock_access_values(mower_data)
     sys_status_name = values["sys_status_name"]
     docked_or_charging = _is_docked_or_charging(values)
+    trusted_docked_or_charging = _is_trusted_docked_or_charging(entity, values)
     signature = _dock_access_signature(values)
 
-    if docked_or_charging:
-        entity._was_docked_or_charging = True
+    if trusted_docked_or_charging:
+        entity._dock_access_last_docked_or_charging_at = time.monotonic()
         entity._dock_access_departure_grace_used = False
     else:
         entity._dock_access_return_latch_satisfied = False
@@ -273,6 +301,12 @@ def _dock_access_attributes(
     values["return_latched"] = entity._dock_access_return_latched
     values["return_latch_satisfied"] = entity._dock_access_return_latch_satisfied
     docked_since = entity._dock_access_return_latched_docked_since
+    last_docked_at = entity._dock_access_last_docked_or_charging_at
+    values["last_trusted_docked_seconds"] = (
+        None
+        if last_docked_at is None
+        else max(0, int(time.monotonic() - last_docked_at))
+    )
     values["return_latched_docked_seconds"] = (
         None
         if docked_since is None
@@ -319,10 +353,10 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
     """Mammotion sensor entity."""
 
     entity_description: MammotionBinarySensorEntityDescription
-    _was_docked_or_charging: bool
     _dock_access_departure_grace_signature: tuple[Any, ...] | None
     _dock_access_departure_grace_until: float | None
     _dock_access_departure_grace_used: bool
+    _dock_access_last_docked_or_charging_at: float | None
     _dock_access_return_latched: bool
     _dock_access_return_latch_satisfied: bool
     _dock_access_return_latched_docked_since: float | None
@@ -344,10 +378,10 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         self._attr_translation_key = (
             entity_description.translation_key or entity_description.key
         )
-        self._was_docked_or_charging = False
         self._dock_access_departure_grace_signature = None
         self._dock_access_departure_grace_until = None
         self._dock_access_departure_grace_used = False
+        self._dock_access_last_docked_or_charging_at = None
         self._dock_access_return_latched = False
         self._dock_access_return_latch_satisfied = False
         self._dock_access_return_latched_docked_since = None
@@ -458,7 +492,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             "(sys_status=%s sys_status_name=%s charge_state=%s "
             "position_type=%s position_type_name=%s work_zone=%s "
             "access_phase=%s return_latched=%s return_latch_satisfied=%s "
-            "return_latched_docked_seconds=%s "
+            "return_latched_docked_seconds=%s last_trusted_docked_seconds=%s "
             "last_report_age_seconds=%s source_hint=%s)",
             self.coordinator.device_name,
             is_on,
@@ -472,8 +506,18 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
             attrs["return_latched"],
             attrs["return_latch_satisfied"],
             attrs["return_latched_docked_seconds"],
+            attrs["last_trusted_docked_seconds"],
             attrs["last_report_age_seconds"],
             attrs["source_hint"],
+        )
+
+    def _dock_access_recently_docked_or_charging(self) -> bool:
+        """Return whether a trusted docked report was seen recently enough."""
+        if self._dock_access_last_docked_or_charging_at is None:
+            return False
+        return (
+            time.monotonic() - self._dock_access_last_docked_or_charging_at
+            <= RECENT_DOCKED_DEPARTURE_SECONDS
         )
 
     def _dock_access_departure_grace_active(

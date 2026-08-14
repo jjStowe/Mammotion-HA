@@ -273,8 +273,31 @@ def test_delayed_recharge_reports_do_not_reopen_access() -> None:
     assert entity.state_timer_due is None
 
 
+def test_sustained_recharge_without_return_report_enables_resume() -> None:
+    """Verify sustained dock evidence restores departure handling after recharge."""
+    _, entity, clock_patch = _entity()
+    with clock_patch:
+        entity.update(0, _mower_data(13))
+        entity.update(1, _mower_data(39, charge_state=1, position_type=5))
+
+        assert entity.journey == DockAccessJourney.AWAY
+        assert not entity.access_requested
+        assert entity.journey_timer_due == 61
+
+        entity.fire_journey_timer(61)
+
+        assert entity.journey == DockAccessJourney.ARRIVED
+        assert not entity.access_requested
+
+        entity.update(100, _mower_data(13, charge_state=1, position_type=5))
+
+    assert entity.journey == DockAccessJourney.DEPARTING
+    assert entity.access_requested
+    assert entity.journey_timer_due == 190
+
+
 def test_charging_pause_confirms_established_return() -> None:
-    """Verify charging pause can finish, but cannot initiate, a return."""
+    """Verify charging pause can finish an established return."""
     _, entity, clock_patch = _entity()
     with clock_patch:
         entity.update(0, _mower_data(13))

@@ -53,6 +53,7 @@ DEPARTURE_GRACE_SECONDS = 90
 DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
 DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
 ARRIVAL_DOCKED_STABLE_SECONDS = 20
+IMPLICIT_ARRIVAL_DOCKED_STABLE_SECONDS = 60
 
 
 class DockAccessJourney(StrEnum):
@@ -181,7 +182,9 @@ def _clear_dock_access_arrival_candidate(
 
 
 def _dock_access_arrival_is_stable(
-    entity: "MammotionBinarySensorEntity", values: dict[str, Any]
+    entity: "MammotionBinarySensorEntity",
+    values: dict[str, Any],
+    stable_seconds: float = ARRIVAL_DOCKED_STABLE_SECONDS,
 ) -> bool:
     """Return whether credible arrival evidence has remained stable long enough."""
     if not _is_docked_or_charging(values):
@@ -192,15 +195,13 @@ def _dock_access_arrival_is_stable(
     if entity._dock_access_arrival_candidate_since is None:
         entity._cancel_dock_access_journey_reevaluation()
         entity._dock_access_arrival_candidate_since = now
-        entity._schedule_dock_access_journey_reevaluation(
-            ARRIVAL_DOCKED_STABLE_SECONDS
-        )
+        entity._schedule_dock_access_journey_reevaluation(stable_seconds)
         return False
 
     elapsed = now - entity._dock_access_arrival_candidate_since
-    if elapsed < ARRIVAL_DOCKED_STABLE_SECONDS:
+    if elapsed < stable_seconds:
         entity._schedule_dock_access_journey_reevaluation(
-            ARRIVAL_DOCKED_STABLE_SECONDS - elapsed
+            stable_seconds - elapsed
         )
         return False
     return True
@@ -268,9 +269,17 @@ def _transition_dock_access_from_away(
 ) -> None:
     """Apply transitions from the away state."""
     sys_status_name = values["sys_status_name"]
-    _clear_dock_access_arrival_candidate(entity)
     if sys_status_name == RETURNING_MODE:
         _start_dock_access_return(entity)
+    elif sys_status_name in ARRIVAL_CONFIRMATION_MODES:
+        if _dock_access_arrival_is_stable(
+            entity,
+            values,
+            IMPLICIT_ARRIVAL_DOCKED_STABLE_SECONDS,
+        ):
+            _set_dock_access_journey(entity, DockAccessJourney.ARRIVED)
+    else:
+        _clear_dock_access_arrival_candidate(entity)
 
 
 def _transition_dock_access_from_returning(

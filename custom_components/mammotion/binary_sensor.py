@@ -47,7 +47,6 @@ DEPARTING_DOCK_ACCESS_MODES = {
 RETURNING_MODE = "MODE_RETURNING"
 CHARGING_PAUSE_MODE = "MODE_CHARGING_PAUSE"
 PAUSE_MODE = "MODE_PAUSE"
-RETURNING_DOCK_ACCESS_MODES = {RETURNING_MODE, CHARGING_PAUSE_MODE}
 DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 ARRIVAL_CONFIRMATION_MODES = DOCKED_DOCK_ACCESS_MODES | {CHARGING_PAUSE_MODE}
 DEPARTURE_GRACE_SECONDS = 90
@@ -135,7 +134,7 @@ def _initial_dock_access_journey(values: dict[str, Any]) -> DockAccessJourney:
             if docked_or_charging
             else DockAccessJourney.AWAY
         )
-    if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
+    if sys_status_name == RETURNING_MODE:
         return (
             DockAccessJourney.ARRIVED
             if docked_or_charging
@@ -216,15 +215,10 @@ def _dock_access_phase(
 
 
 def _start_dock_access_return(
-    entity: "MammotionBinarySensorEntity", values: dict[str, Any]
+    entity: "MammotionBinarySensorEntity",
 ) -> None:
-    """Start a return and accept only stable, credible arrival evidence."""
+    """Start a return after an explicit returning-mode report."""
     _set_dock_access_journey(entity, DockAccessJourney.RETURNING)
-    if (
-        values["sys_status_name"] == CHARGING_PAUSE_MODE
-        and _dock_access_arrival_is_stable(entity, values)
-    ):
-        _set_dock_access_journey(entity, DockAccessJourney.ARRIVED)
 
 
 def _transition_dock_access_from_arrived(
@@ -232,14 +226,11 @@ def _transition_dock_access_from_arrived(
 ) -> None:
     """Apply transitions from the arrived state."""
     sys_status_name = values["sys_status_name"]
-    docked_or_charging = _is_docked_or_charging(values)
 
     _clear_dock_access_arrival_candidate(entity)
     if sys_status_name in DEPARTING_DOCK_ACCESS_MODES:
         _set_dock_access_journey(entity, DockAccessJourney.DEPARTING)
     elif sys_status_name == RETURNING_MODE:
-        _set_dock_access_journey(entity, DockAccessJourney.RETURNING)
-    elif sys_status_name == CHARGING_PAUSE_MODE and not docked_or_charging:
         _set_dock_access_journey(entity, DockAccessJourney.RETURNING)
 
 
@@ -250,8 +241,8 @@ def _transition_dock_access_from_departing(
     sys_status_name = values["sys_status_name"]
     docked_or_charging = _is_docked_or_charging(values)
 
-    if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
-        _start_dock_access_return(entity, values)
+    if sys_status_name == RETURNING_MODE:
+        _start_dock_access_return(entity)
         return
     if sys_status_name in DOCKED_DOCK_ACCESS_MODES and docked_or_charging:
         if _dock_access_arrival_is_stable(entity, values):
@@ -277,13 +268,9 @@ def _transition_dock_access_from_away(
 ) -> None:
     """Apply transitions from the away state."""
     sys_status_name = values["sys_status_name"]
-    docked_or_charging = _is_docked_or_charging(values)
-
     _clear_dock_access_arrival_candidate(entity)
-    if sys_status_name in RETURNING_DOCK_ACCESS_MODES:
-        _start_dock_access_return(entity, values)
-    elif sys_status_name in DOCKED_DOCK_ACCESS_MODES and docked_or_charging:
-        _set_dock_access_journey(entity, DockAccessJourney.ARRIVED)
+    if sys_status_name == RETURNING_MODE:
+        _start_dock_access_return(entity)
 
 
 def _transition_dock_access_from_returning(
@@ -332,7 +319,6 @@ def _dock_access_requested(
     entity: "MammotionBinarySensorEntity", mower_data: MowingDevice
 ) -> bool | None:
     values = _raw_dock_access_values(mower_data)
-    sys_status_name = values["sys_status_name"]
     docked_or_charging = _is_docked_or_charging(values)
     now = time.monotonic()
 
@@ -348,14 +334,12 @@ def _dock_access_requested(
             DockAccessJourney.RETURNING,
         )
 
-    journey = entity._dock_access_journey
-    if docked_or_charging and (
-        journey == DockAccessJourney.ARRIVED
-        or sys_status_name in ARRIVAL_CONFIRMATION_MODES
+    _transition_dock_access_journey(entity, values)
+    if (
+        docked_or_charging
+        and entity._dock_access_journey == DockAccessJourney.ARRIVED
     ):
         entity._dock_access_last_docked_or_charging_at = now
-
-    _transition_dock_access_journey(entity, values)
 
     return entity._dock_access_journey in (
         DockAccessJourney.DEPARTING,

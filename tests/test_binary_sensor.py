@@ -249,12 +249,36 @@ def test_complete_departure_and_return_journey() -> None:
     assert not entity.access_requested
 
 
-def test_charging_pause_away_completes_return_after_arrival() -> None:
-    """Verify an away charging pause starts and completes a return journey."""
+def test_delayed_recharge_reports_do_not_reopen_access() -> None:
+    """Verify delayed recharge frames cannot reopen access during mowing."""
+    _, entity, clock_patch = _entity()
+    with clock_patch:
+        entity.update(0, _mower_data(11, charge_state=1, position_type=5))
+        entity.update(1, _mower_data(13, charge_state=1, position_type=5))
+        entity.update(30, _mower_data(13))
+        entity.fire_journey_timer(91)
+        entity.fire_state_timer(106)
+
+        assert entity.journey == DockAccessJourney.AWAY
+        assert not entity.access_requested
+
+        entity.update(120, _mower_data(39))
+        entity.update(121, _mower_data(39, charge_state=1, position_type=5))
+        entity.update(122, _mower_data(15, charge_state=1, position_type=5))
+        entity.update(123, _mower_data(13))
+
+    assert entity.journey == DockAccessJourney.AWAY
+    assert not entity.access_requested
+    assert entity.journey_timer_due is None
+    assert entity.state_timer_due is None
+
+
+def test_charging_pause_confirms_established_return() -> None:
+    """Verify charging pause can finish, but cannot initiate, a return."""
     _, entity, clock_patch = _entity()
     with clock_patch:
         entity.update(0, _mower_data(13))
-        entity.update(1, _mower_data(39))
+        entity.update(1, _mower_data(14))
         entity.update(70, _mower_data(39, charge_state=1, position_type=5))
         entity.fire_journey_timer(90)
         entity.fire_state_timer(105)

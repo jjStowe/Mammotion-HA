@@ -49,6 +49,7 @@ CHARGING_PAUSE_MODE = "MODE_CHARGING_PAUSE"
 PAUSE_MODE = "MODE_PAUSE"
 DOCKED_DOCK_ACCESS_MODES = {"MODE_READY", "MODE_CHARGING", "MODE_NOT_ACTIVE"}
 ARRIVAL_CONFIRMATION_MODES = DOCKED_DOCK_ACCESS_MODES | {CHARGING_PAUSE_MODE}
+IMPLICIT_ARRIVAL_CONFIRMATION_MODES = ARRIVAL_CONFIRMATION_MODES | {PAUSE_MODE}
 DEPARTURE_GRACE_SECONDS = 90
 DOCK_ACCESS_MIN_REQUEST_SECONDS = 60
 DOCK_ACCESS_CLOSE_DEBOUNCE_SECONDS = 15
@@ -245,7 +246,10 @@ def _transition_dock_access_from_departing(
     if sys_status_name == RETURNING_MODE:
         _start_dock_access_return(entity)
         return
-    if sys_status_name in DOCKED_DOCK_ACCESS_MODES and docked_or_charging:
+    if (
+        sys_status_name in IMPLICIT_ARRIVAL_CONFIRMATION_MODES
+        and docked_or_charging
+    ):
         if _dock_access_arrival_is_stable(entity, values):
             _set_dock_access_journey(entity, DockAccessJourney.ARRIVED)
         return
@@ -271,7 +275,7 @@ def _transition_dock_access_from_away(
     sys_status_name = values["sys_status_name"]
     if sys_status_name == RETURNING_MODE:
         _start_dock_access_return(entity)
-    elif sys_status_name in ARRIVAL_CONFIRMATION_MODES:
+    elif sys_status_name in IMPLICIT_ARRIVAL_CONFIRMATION_MODES:
         if _dock_access_arrival_is_stable(
             entity,
             values,
@@ -298,6 +302,12 @@ def _transition_dock_access_from_returning(
         )
     elif sys_status_name == PAUSE_MODE:
         _set_dock_access_journey(entity, DockAccessJourney.AWAY)
+        if docked_or_charging:
+            _dock_access_arrival_is_stable(
+                entity,
+                values,
+                IMPLICIT_ARRIVAL_DOCKED_STABLE_SECONDS,
+            )
     elif sys_status_name == RETURNING_MODE:
         # MODE_RETURNING is authoritative. Dock fields often lag or arrive
         # out of order, so they cannot complete the journey by themselves.

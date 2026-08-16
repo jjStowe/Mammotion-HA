@@ -264,8 +264,9 @@ def test_delayed_recharge_reports_do_not_reopen_access() -> None:
 
         entity.update(120, _mower_data(39))
         entity.update(121, _mower_data(39, charge_state=1, position_type=5))
-        entity.update(122, _mower_data(15, charge_state=1, position_type=5))
-        entity.update(123, _mower_data(13))
+        entity.update(122, _mower_data(19, charge_state=1, position_type=5))
+        entity.update(123, _mower_data(15, charge_state=1, position_type=5))
+        entity.update(124, _mower_data(13))
 
     assert entity.journey == DockAccessJourney.AWAY
     assert not entity.access_requested
@@ -278,7 +279,7 @@ def test_sustained_recharge_without_return_report_enables_resume() -> None:
     _, entity, clock_patch = _entity()
     with clock_patch:
         entity.update(0, _mower_data(13))
-        entity.update(1, _mower_data(39, charge_state=1, position_type=5))
+        entity.update(1, _mower_data(19, charge_state=1, position_type=5))
 
         assert entity.journey == DockAccessJourney.AWAY
         assert not entity.access_requested
@@ -294,6 +295,24 @@ def test_sustained_recharge_without_return_report_enables_resume() -> None:
     assert entity.journey == DockAccessJourney.DEPARTING
     assert entity.access_requested
     assert entity.journey_timer_due == 190
+
+
+def test_docked_pause_settles_as_implicit_arrival() -> None:
+    """Verify docked pause ends a return before confirming stable arrival."""
+    _, entity, clock_patch = _entity()
+    with clock_patch:
+        entity.update(0, _mower_data(13))
+        entity.update(1, _mower_data(14))
+        entity.update(70, _mower_data(19, charge_state=1, position_type=5))
+
+        assert entity.journey == DockAccessJourney.AWAY
+        assert entity.journey_timer_due == 130
+
+        entity.fire_state_timer(85)
+        entity.fire_journey_timer(130)
+
+    assert entity.journey == DockAccessJourney.ARRIVED
+    assert not entity.access_requested
 
 
 def test_charging_pause_confirms_established_return() -> None:

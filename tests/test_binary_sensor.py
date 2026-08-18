@@ -128,6 +128,29 @@ def _entity() -> tuple[FakeClock, FakeDockAccessEntity, Any]:
     return clock, entity, clock_patch
 
 
+def test_last_report_age_uses_monotonic_report_timestamp() -> None:
+    """Verify report age compares two monotonic clock values."""
+    handle = SimpleNamespace(last_report_data_at=40.25)
+    coordinator = SimpleNamespace(
+        device_name="test-mower",
+        manager=SimpleNamespace(mower=lambda _: handle),
+    )
+
+    with patch.object(binary_sensor_module.time, "monotonic", return_value=45.75):
+        assert binary_sensor_module._last_report_age_seconds(coordinator) == 5  # noqa: SLF001
+
+
+def test_last_report_age_is_unknown_before_first_report() -> None:
+    """Verify a zero monotonic timestamp means no report has arrived."""
+    handle = SimpleNamespace(last_report_data_at=0.0)
+    coordinator = SimpleNamespace(
+        device_name="test-mower",
+        manager=SimpleNamespace(mower=lambda _: handle),
+    )
+
+    assert binary_sensor_module._last_report_age_seconds(coordinator) is None  # noqa: SLF001
+
+
 def test_returning_ignores_stale_docked_telemetry() -> None:
     """Verify MODE_RETURNING remains authoritative despite stale dock fields."""
     _, entity, clock_patch = _entity()

@@ -28,8 +28,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.debounce import Debouncer
-from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers.storage import Store
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from mashumaro.exceptions import InvalidFieldValue
 from pymammotion.aliyun.exceptions import (
@@ -50,7 +49,7 @@ from pymammotion.data.model.device import (
     RTKBaseStationDevice,
 )
 from pymammotion.data.model.device_config import OperationSettings, create_path_order
-from pymammotion.data.model.hash_list import AreaHashNameList, Plan, SvgMessage
+from pymammotion.data.model.hash_list import Plan, SvgMessage
 from pymammotion.data.model.pool_state import PoolPlan, SpinoToggle
 from pymammotion.data.model.report_info import Maintain, NetUsedType
 from pymammotion.data.mqtt.event import DeviceNotificationEventParams, ThingEventMessage
@@ -64,7 +63,6 @@ from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
 from pymammotion.proto import MulSex
 from pymammotion.state.device_state import DeviceShutdownEvent, DeviceSnapshot
 from pymammotion.transport.base import (
-    AuthError,
     BLEUnavailableError,
     CommandTimeoutError,
     ConcurrentRequestError,
@@ -83,7 +81,7 @@ from pymammotion.utility.svg import chunk_svg_messages
 from webrtc_models import RTCIceServer
 
 from .agora_api import SERVICE_IDS, AgoraAPIClient, AgoraResponse
-from .config import MammotionConfigStore
+from .config import MammotionConfigStore, async_get_store
 from .const import (
     CONF_ACCOUNTNAME,
     CONF_CONNECT_DATA,
@@ -101,6 +99,7 @@ if TYPE_CHECKING:
 MAINTENANCE_INTERVAL = timedelta(minutes=60)
 DEFAULT_INTERVAL = timedelta(minutes=30)
 REPORT_INTERVAL = timedelta(minutes=5)
+DYNAMICS_LINE_INTERVAL = timedelta(seconds=10)
 DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
@@ -168,6 +167,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self.map_offset_lon: float = 0.0
         self._bluetooth_enabled: bool = True
         self._cloud_enabled: bool = True
+        self._store: MammotionConfigStore = async_get_store(hass, config_entry)
 
         mower_device = self.manager.get_device_by_name(self.device_name)
 
@@ -390,16 +390,24 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 await handle.disconnect_transport(t_type)
 
     async def async_refresh_login(self, exc: Exception | None = None) -> None:
-        """Refresh login credentials asynchronously.
+        """Refresh whichever credentials the failure actually implicates.
 
-        LoginFailedError means the client already exhausted all recovery options
-        (targeted refresh → force refresh → full re-login).  Raise ConfigEntryAuthFailed
-        so HA tells the user to reconfigure the integration.
+        LoginFailedError means an explicit login attempt was rejected, so the
+        stored password is wrong — ask the user to reconfigure immediately.
 
-        For other auth errors, selectively refresh the affected transport:
-        - SessionExpiredError: refreshes credentials for the specific transport.
-        - AuthError (generic): performs a full login refresh.
-        - Other/unknown: performs a full login refresh.
+        Otherwise route by what failed.  A SessionExpiredError names its transport,
+        so refresh only that one; anything else goes through
+        ``MammotionClient.refresh_login``, which itself routes by the transports the
+        account actually has.
+
+        Crucially, a ReLoginRequiredError does NOT always mean "make the user log in
+        again".  pymammotion also raises it when one cloud transport's credentials
+        are unrenewable while the account's HTTP login is still perfectly valid — it
+        gives up on that transport alone and marks its mowers unavailable.  Forcing a
+        reauth prompt there would cost the user their working credentials, and take
+        down the account's *other* transport, to fix a fault confined to one.  Only
+        ``TokenManager.reauth_required`` — set when the HTTP refresh token itself is
+        rejected — justifies ConfigEntryAuthFailed.
         """
         if not self.has_cloud_account:
             return
@@ -408,23 +416,35 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             raise ConfigEntryAuthFailed(
                 f"Login failed for Mammotion account: {exc}"
             ) from exc
+
+        token_manager = self.manager.token_manager
         try:
-            if (
-                isinstance(exc, SessionExpiredError)
-                and self.manager.token_manager is not None
-            ):
-                await self.manager.token_manager.refresh_aliyun_credentials()
-            elif isinstance(exc, AuthError) and self.manager.token_manager is not None:
-                await self.manager.token_manager.refresh_mqtt_credentials()
+            if isinstance(exc, SessionExpiredError) and token_manager is not None:
+                if exc.transport_type is TransportType.CLOUD_ALIYUN:
+                    await token_manager.refresh_aliyun_credentials()
+                elif exc.transport_type is TransportType.CLOUD_MAMMOTION:
+                    await token_manager.refresh_mqtt_credentials()
+                else:
+                    await self.manager.refresh_login(self.account)
             else:
                 await self.manager.refresh_login(self.account)
-                self.store_cloud_credentials()
+            self.store_cloud_credentials()
         except CloudSetupError as err:
             LOGGER.error("Aliyun cloud setup failed during re-login: %s", err)
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="cloud_setup_failed"
             ) from err
         except ReLoginRequiredError as err:
+            if token_manager is not None and token_manager.reauth_required is None:
+                # Transport-scoped: the account login is still good.  pymammotion has
+                # already given up on the failing transport and signalled its mowers.
+                LOGGER.warning(
+                    "Mammotion account %s: a cloud transport is unavailable (%s); "
+                    "account login is still valid, keeping stored credentials",
+                    self.account,
+                    err,
+                )
+                return
             raise ConfigEntryAuthFailed(
                 f"Re-authentication required for Mammotion account: {err}"
             ) from err
@@ -1266,10 +1286,9 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
     async def async_restore_data(self) -> None:
         """Restore saved data."""
-        store: MammotionConfigStore = MammotionConfigStore(
-            self.hass, version=1, minor_version=2, key=self.device_name
+        restored_data: Mapping[str, Any] | None = await self._store.async_device_data(
+            self.device_name
         )
-        restored_data: Mapping[str, Any] | None = await store.async_load()
 
         handle = self.manager.mower(self.device_name)
 
@@ -1292,17 +1311,25 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             if handle is not None:
                 handle.restore_device(empty)
 
-    async def async_save_data(self, data: MowingDevice | PoolCleanerDevice) -> None:
-        """Store data."""
-        store: Store = Store(
-            self.hass, version=1, minor_version=2, key=self.device_name
+    @callback
+    def async_save_data(self, data: MowingDevice | PoolCleanerDevice) -> None:
+        """Queue device state for persistence.
+
+        Returns immediately: the state is kept in memory and written at most
+        once per ``SAVE_DELAY``.  Callers on the poll path must not wait for the
+        disk.
+        """
+        self._store.async_update_device_data(
+            self.device_name, cast(dict[str, Any], data.to_dict())
         )
-        await store.async_save(data.to_dict())
+
+    async def async_flush_saved_data(self) -> None:
+        """Write any queued device state to disk immediately."""
+        await self._store.async_flush()
 
     async def remove_saved_data(self) -> None:
         """Remove saved coordinator data from persistent storage."""
-        store = Store(self.hass, version=1, minor_version=2, key=self.device_name)
-        await store.async_remove()
+        await self._store.async_remove_device(self.device_name)
 
     async def _async_update_data(self) -> DataT | None:
         """Update data from the device."""
@@ -1425,7 +1452,8 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self._subscriptions.append(handle.subscribe_map_updated(_on_map_updated))
 
     async def async_shutdown(self) -> None:
-        """Cancel all RAII subscriptions and delegate to HA coordinator shutdown."""
+        """Flush queued state, cancel RAII subscriptions and shut down the coordinator."""
+        await self.async_flush_saved_data()
         for sub in self._subscriptions:
             sub.cancel()
         self._subscriptions.clear()
@@ -1457,24 +1485,22 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         if area_hash == 0:
             return None
 
-        name = None
         _mower_data = cast(MowingDevice, self.data)
-        if area_data := _mower_data.map.area.get(area_hash):
-            area_frame = area_data.data[0] if len(area_data.data) > 0 else None
-            if area_frame is not None:
-                area_name: AreaHashNameList | None = next(
-                    (
-                        area
-                        for area in _mower_data.map.area_name
-                        if area.hash == area_frame.hash
-                    ),
-                    None,
-                )
-                name = area_name.name if area_name is not None else None
-        else:
+        if area_hash not in _mower_data.map.area:
             return "path"
 
-        return name if name else f"area {area_hash}"
+        # Prefer the user's HA-level entity name over the device-assigned name.
+        entity_reg = er.async_get(self.hass)
+        unique_id = f"{self.unique_name}_{area_hash}"
+        entity_id = entity_reg.async_get_entity_id("switch", DOMAIN, unique_id)
+        if entity_id and (entry := entity_reg.async_get(entity_id)) and entry.name:
+            return entry.name
+
+        for area in _mower_data.map.computed_areas:
+            if area.hash == area_hash:
+                return area.name
+
+        return f"area {area_hash}"
 
     @property
     def map_sync_status(self) -> str:
@@ -1496,7 +1522,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         if self.data is None:
             return "out_of_sync"
 
-        mower_data = cast(MowingDevice, self.data)
+        mower_data = self.data
         locations = mower_data.report_data.locations
         bol_hash = locations[0].bol_hash if locations else 0
         if mower_data.map.is_map_synced(bol_hash):
@@ -1624,7 +1650,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         LOGGER.debug("Updated Mammotion device %s", self.device_name)
         self.update_failures = 0
-        await self.async_save_data(device)
+        self.async_save_data(device)
 
         if self.data.mower_state.ble_mac != "" and len(self._on_stop) == 0:
             self._on_stop.append(
@@ -1978,6 +2004,8 @@ class MammotionDeviceVersionUpdateCoordinator(
 class MammotionMapUpdateCoordinator(MammotionBaseUpdateCoordinator[MowerInfo]):
     """Class to manage fetching mammotion data."""
 
+    _dynamics_line_cancel: CALLBACK_TYPE | None = None
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -2046,12 +2074,71 @@ class MammotionMapUpdateCoordinator(MammotionBaseUpdateCoordinator[MowerInfo]):
         assert _d is not None
         return _d.mower_state
 
+    def _device_supports_dynamics_line(self) -> bool:
+        """Return True if this device supports the dynamics-line mow-progress stream."""
+        device = self.manager.get_device_by_name(self.device_name)
+        firmware = device.device_firmwares.main_controller if device else None
+        return DeviceType.value_of_str(self.device_name).is_support_dynamics_line(
+            firmware
+        )
+
+    def _ble_is_connected(self) -> bool:
+        """Return True if BLE transport exists and is currently connected."""
+        if handle := self.manager.mower(self.device_name):
+            if ble := handle.get_transport(TransportType.BLE):
+                return ble.is_connected
+        return False
+
+    def _stop_dynamics_line_poll(self) -> None:
+        if self._dynamics_line_cancel is not None:
+            self._dynamics_line_cancel()
+            self._dynamics_line_cancel = None
+
+    async def _on_sys_status_changed_dynamics(self, sys_status: int) -> None:
+        """Start the dynamics-line poll when mowing over BLE; stop it otherwise."""
+        if (
+            sys_status in MOWING_ACTIVE_MODES
+            and self._device_supports_dynamics_line()
+            and self._ble_is_connected()
+        ):
+            if self._dynamics_line_cancel is None:
+                self._dynamics_line_cancel = async_track_time_interval(
+                    self.hass,
+                    self._fetch_dynamics_line,
+                    DYNAMICS_LINE_INTERVAL,
+                )
+        else:
+            self._stop_dynamics_line_poll()
+
+    async def _fetch_dynamics_line(self, _now: datetime.datetime) -> None:
+        """Fetch the dynamics line; self-cancels if BLE has disconnected."""
+        if not self._ble_is_connected():
+            self._stop_dynamics_line_poll()
+            return
+        try:
+            await self.manager.get_dynamics_line(self.device_name)
+            device = self.manager.get_device_by_name(self.device_name)
+            if device is not None:
+                self.async_set_updated_data(device.mower_state)
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            GatewayTimeoutException,
+        ):
+            pass
+
     async def _async_setup(self) -> None:
         """Set up coordinator with initial call to get map data."""
         await super()._async_setup()
         device = self.manager.get_device_by_name(self.device_name)
         if device is None:
             return
+
+        if handle := self.manager.mower(self.device_name):
+            handle.watch_field(
+                lambda s: s.raw.report_data.dev.sys_status,
+                self._on_sys_status_changed_dynamics,
+            )
 
         if not device.enabled or not device.online:
             return
@@ -2256,10 +2343,9 @@ class MammotionRTKCoordinator(MammotionBaseUpdateCoordinator[RTKBaseStationDevic
 
     async def async_restore_data(self) -> None:
         """Restore saved data."""
-        store = MammotionConfigStore(
-            self.hass, version=1, minor_version=2, key=self.device_name
+        restored_data: Mapping[str, Any] | None = await self._store.async_device_data(
+            self.device_name
         )
-        restored_data: Mapping[str, Any] | None = await store.async_load()
 
         handle = self.manager.rtk_device(self.device_name)
 
@@ -2317,13 +2403,6 @@ class MammotionRTKCoordinator(MammotionBaseUpdateCoordinator[RTKBaseStationDevic
                     pass
 
         return self.data
-
-    async def async_shutdown(self) -> None:
-        """Cancel all RAII subscriptions and delegate to HA coordinator shutdown."""
-        for sub in self._subscriptions:
-            sub.cancel()
-        self._subscriptions.clear()
-        await super().async_shutdown()
 
     async def _async_setup(self) -> None:
         """Set up RTK device subscriptions and fetch one-time HTTP data."""
@@ -2417,6 +2496,14 @@ class MammotionSpinoCoordinator(MammotionBaseUpdateCoordinator[PoolCleanerDevice
                         context=0,
                         rw=0,
                     )
+            # Fetch pool geometry once at startup.  Responses arrive as unsolicited
+            # APP_DOWNLINK_CMD frames and are reassembled by PoolStateReducer.
+            for fetch in (self.async_fetch_pool_map, self.async_fetch_pool_line):
+                with contextlib.suppress(
+                    GatewayTimeoutException,
+                    NoTransportAvailableError,
+                ):
+                    await fetch()
         except DeviceOfflineException:
             self.device.online = False
 
@@ -2428,10 +2515,9 @@ class MammotionSpinoCoordinator(MammotionBaseUpdateCoordinator[PoolCleanerDevice
 
     async def async_restore_data(self) -> None:
         """Restore saved data."""
-        store = MammotionConfigStore(
-            self.hass, version=1, minor_version=2, key=self.device_name
+        restored_data: Mapping[str, Any] | None = await self._store.async_device_data(
+            self.device_name
         )
-        restored_data: Mapping[str, Any] | None = await store.async_load()
 
         handle = self.manager.mower(self.device_name)
 
@@ -2524,7 +2610,7 @@ class MammotionSpinoCoordinator(MammotionBaseUpdateCoordinator[PoolCleanerDevice
                 except (DeviceOfflineException, GatewayTimeoutException):
                     pass
 
-        await self.async_save_data(self.data)
+        self.async_save_data(self.data)
 
         return self.data
 

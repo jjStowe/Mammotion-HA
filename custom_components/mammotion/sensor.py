@@ -4,8 +4,9 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import time
 from functools import partial
+from time import monotonic
 from typing import Any
 
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
@@ -120,7 +121,7 @@ def _get_nested(value: Any, *path: str) -> Any:
                 current = current.get(part)
             else:
                 current = getattr(current, part)
-        except (AttributeError, TypeError):
+        except AttributeError, TypeError:
             return None
     return current
 
@@ -137,7 +138,7 @@ def _device_mode_name(sys_status: Any) -> str | None:
         return None
     try:
         return device_mode(sys_status)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(sys_status)
 
 
@@ -146,7 +147,7 @@ def _position_type_name(position_type: Any) -> str | None:
         return None
     try:
         return PosType(position_type).name
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(position_type)
 
 
@@ -181,18 +182,10 @@ def _last_report_age_seconds(
     coordinator: MammotionReportUpdateCoordinator,
 ) -> int | None:
     handle = coordinator.manager.mower(coordinator.device_name)
-    last_report_at = getattr(handle, "last_report_at", None) if handle else None
-    if last_report_at is None:
+    last_report_at = getattr(handle, "last_report_data_at", 0.0) if handle else 0.0
+    if not isinstance(last_report_at, (int, float)) or last_report_at <= 0:
         return None
-
-    if isinstance(last_report_at, datetime):
-        age = datetime.now(last_report_at.tzinfo) - last_report_at
-        return max(0, int(age.total_seconds()))
-
-    if isinstance(last_report_at, (int, float)):
-        return max(0, int(datetime.now().timestamp() - last_report_at))
-
-    return None
+    return max(0, int(monotonic() - last_report_at))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -291,7 +284,9 @@ LUBA_2_YUKA_ONLY_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         native_unit_of_measurement=UnitOfTime.SECONDS,
-        value_fn=lambda mower_data: mower_data.report_data.maintenance.blade_used_time.blade_used_time,
+        value_fn=lambda mower_data: (
+            mower_data.report_data.maintenance.blade_used_time.blade_used_time
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
         suggested_unit_of_measurement=UnitOfTime.HOURS,
     ),
@@ -300,7 +295,9 @@ LUBA_2_YUKA_ONLY_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         native_unit_of_measurement=UnitOfTime.SECONDS,
-        value_fn=lambda mower_data: mower_data.report_data.maintenance.blade_used_time.blade_used_warn_time,
+        value_fn=lambda mower_data: (
+            mower_data.report_data.maintenance.blade_used_time.blade_used_warn_time
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
         suggested_unit_of_measurement=UnitOfTime.HOURS,
     ),
@@ -400,8 +397,10 @@ SENSOR_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        value_fn=lambda mower_data: (mower_data.report_data.work.progress & 65535)
-        - (mower_data.report_data.work.progress >> 16),
+        value_fn=lambda mower_data: (
+            (mower_data.report_data.work.progress & 65535)
+            - (mower_data.report_data.work.progress >> 16)
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
@@ -464,9 +463,9 @@ SENSOR_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         key="position_mode",
         state_class=None,
         device_class=SensorDeviceClass.ENUM,
-        value_fn=lambda mower_data: RTKPositionMode(
-            mower_data.report_data.basestation_info.rtk_status
-        ).name,
+        value_fn=lambda mower_data: (
+            RTKPositionMode(mower_data.report_data.basestation_info.rtk_status).name
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
@@ -503,7 +502,9 @@ SENSOR_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
     ),
     MammotionSensorEntityDescription(
         key="raw_position_type",
-        value_fn=lambda mower_data: _get_nested(mower_data, "location", "position_type"),
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "location", "position_type"
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
@@ -516,7 +517,9 @@ SENSOR_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
     ),
     MammotionSensorEntityDescription(
         key="raw_work_zone",
-        value_fn=lambda mower_data: _get_nested(mower_data, "mowing_state", "zone_hash"),
+        value_fn=lambda mower_data: _get_nested(
+            mower_data, "mowing_state", "zone_hash"
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
@@ -644,8 +647,9 @@ LUBA_2_YUKA_SIGNAL_TYPES: tuple[MammotionSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         device_class=None,
         native_unit_of_measurement=None,
-        value_fn=lambda mower_data: (mower_data.report_data.rtk.co_view_stars >> 8)
-        & 255,
+        value_fn=lambda mower_data: (
+            (mower_data.report_data.rtk.co_view_stars >> 8) & 255
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionSensorEntityDescription(
@@ -792,6 +796,22 @@ SPINO_SENSOR_TYPES: tuple[MammotionSpinoSensorEntityDescription, ...] = (
         value_fn=lambda spino_data: spino_data.pool_state.work_mode.name,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+    MammotionSpinoSensorEntityDescription(
+        key="spino_ble_rssi",
+        state_class=SensorStateClass.MEASUREMENT,
+        device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+        native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+        value_fn=lambda spino_data: spino_data.pool_state.ble_rssi,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionSpinoSensorEntityDescription(
+        key="spino_wifi_rssi",
+        state_class=SensorStateClass.MEASUREMENT,
+        device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+        native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+        value_fn=lambda spino_data: spino_data.pool_state.wifi_rssi,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
 )
 
 SPINO_ERROR_SENSOR_TYPES: tuple[MammotionSpinoErrorSensorEntityDescription, ...] = (
@@ -825,9 +845,9 @@ SPINO_ERROR_SENSOR_TYPES: tuple[MammotionSpinoErrorSensorEntityDescription, ...]
         native_unit_of_measurement=None,
         device_class=SensorDeviceClass.ENUM,
         options=["online", "offline"],
-        value_fn=lambda coordinator: "online"
-        if coordinator.mqtt_device_online
-        else "offline",
+        value_fn=lambda coordinator: (
+            "online" if coordinator.mqtt_device_online else "offline"
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )

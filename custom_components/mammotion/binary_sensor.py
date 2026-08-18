@@ -18,14 +18,14 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
-from pymammotion.data.model.device import MowingDevice
+from pymammotion.data.model.device import MowingDevice, PoolCleanerDevice
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.constant.device_constant import PosType, device_mode
 
 from . import MammotionConfigEntry
 from .const import LOGGER
-from .coordinator import MammotionBaseUpdateCoordinator
-from .entity import MammotionBaseEntity
+from .coordinator import MammotionBaseUpdateCoordinator, MammotionSpinoCoordinator
+from .entity import MammotionBaseEntity, MammotionBaseSpinoEntity
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -77,7 +77,7 @@ def _get_nested(value: Any, *path: str) -> Any:
                 current = current.get(part)
             else:
                 current = getattr(current, part)
-        except (AttributeError, TypeError):
+        except AttributeError, TypeError:
             return None
     return current
 
@@ -87,7 +87,7 @@ def _device_mode_name(sys_status: Any) -> str | None:
         return None
     try:
         return device_mode(sys_status)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(sys_status)
 
 
@@ -96,7 +96,7 @@ def _position_type_name(position_type: Any) -> str | None:
         return None
     try:
         return PosType(position_type).name
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(position_type)
 
 
@@ -115,8 +115,7 @@ def _raw_dock_access_values(mower_data: MowingDevice) -> dict[str, Any]:
 
 def _is_docked_or_charging(values: dict[str, Any]) -> bool:
     return (
-        values["charge_state"] in (1, 2)
-        or values["position_type_name"] == "CHARGE_ON"
+        values["charge_state"] in (1, 2) or values["position_type_name"] == "CHARGE_ON"
     )
 
 
@@ -201,9 +200,7 @@ def _dock_access_arrival_is_stable(
 
     elapsed = now - entity._dock_access_arrival_candidate_since
     if elapsed < stable_seconds:
-        entity._schedule_dock_access_journey_reevaluation(
-            stable_seconds - elapsed
-        )
+        entity._schedule_dock_access_journey_reevaluation(stable_seconds - elapsed)
         return False
     return True
 
@@ -246,10 +243,7 @@ def _transition_dock_access_from_departing(
     if sys_status_name == RETURNING_MODE:
         _start_dock_access_return(entity)
         return
-    if (
-        sys_status_name in IMPLICIT_ARRIVAL_CONFIRMATION_MODES
-        and docked_or_charging
-    ):
+    if sys_status_name in IMPLICIT_ARRIVAL_CONFIRMATION_MODES and docked_or_charging:
         if _dock_access_arrival_is_stable(entity, values):
             _set_dock_access_journey(entity, DockAccessJourney.ARRIVED)
         return
@@ -354,10 +348,7 @@ def _dock_access_requested(
         )
 
     _transition_dock_access_journey(entity, values)
-    if (
-        docked_or_charging
-        and entity._dock_access_journey == DockAccessJourney.ARRIVED
-    ):
+    if docked_or_charging and entity._dock_access_journey == DockAccessJourney.ARRIVED:
         entity._dock_access_last_docked_or_charging_at = now
 
     return entity._dock_access_journey in (
@@ -381,18 +372,10 @@ def _source_hint(coordinator: MammotionBaseUpdateCoordinator) -> str:
 
 def _last_report_age_seconds(coordinator: MammotionBaseUpdateCoordinator) -> int | None:
     handle = coordinator.manager.mower(coordinator.device_name)
-    last_report_at = getattr(handle, "last_report_at", None) if handle else None
-    if last_report_at is None:
+    last_report_at = getattr(handle, "last_report_data_at", 0.0) if handle else 0.0
+    if not isinstance(last_report_at, (int, float)) or last_report_at <= 0:
         return None
-
-    if isinstance(last_report_at, datetime):
-        age = datetime.now(last_report_at.tzinfo) - last_report_at
-        return max(0, int(age.total_seconds()))
-
-    if isinstance(last_report_at, (int, float)):
-        return max(0, int(datetime.now().timestamp() - last_report_at))
-
-    return None
+    return max(0, int(time.monotonic() - last_report_at))
 
 
 def _dock_access_attributes(
@@ -418,9 +401,7 @@ def _dock_access_attributes(
     values["return_latched"] = journey == DockAccessJourney.RETURNING
     values["return_latch_satisfied"] = journey == DockAccessJourney.ARRIVED
     values["departure_seen_away"] = journey == DockAccessJourney.AWAY
-    values["return_latched_docked_seconds"] = values[
-        "arrival_candidate_seconds"
-    ]
+    values["return_latched_docked_seconds"] = values["arrival_candidate_seconds"]
     last_docked_at = entity._dock_access_last_docked_or_charging_at
     values["last_trusted_docked_seconds"] = (
         None
@@ -432,18 +413,37 @@ def _dock_access_attributes(
     return values
 
 
+@dataclass(frozen=True, kw_only=True)
+class MammotionSpinoBinarySensorEntityDescription(
+    BinarySensorEntityDescription,
+):
+    """Describes a Mammotion Spino pool cleaner binary sensor entity."""
+
+    is_on_fn: Callable[[PoolCleanerDevice], bool | None]
+
+
 BINARY_SENSORS: tuple[MammotionBinarySensorEntityDescription, ...] = (
     MammotionBinarySensorEntityDescription(
         key="charging",
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
-        is_on_fn=lambda entity, mower_data: mower_data.report_data.dev.charge_state
-        in (1, 2),
+        is_on_fn=lambda entity, mower_data: (
+            mower_data.report_data.dev.charge_state in (1, 2)
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MammotionBinarySensorEntityDescription(
         key="dock_access_requested",
         is_on_fn=_dock_access_requested,
         extra_attrs_fn=_dock_access_attributes,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+SPINO_BINARY_SENSORS: tuple[MammotionSpinoBinarySensorEntityDescription, ...] = (
+    MammotionSpinoBinarySensorEntityDescription(
+        key="spino_charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        is_on_fn=lambda spino_data: spino_data.pool_state.charging,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )
@@ -461,6 +461,12 @@ async def async_setup_entry(
         async_add_entities(
             MammotionBinarySensorEntity(mower.reporting_coordinator, entity_description)
             for entity_description in BINARY_SENSORS
+        )
+
+    for spino in entry.runtime_data.spino:
+        async_add_entities(
+            MammotionSpinoBinarySensorEntity(spino.coordinator, entity_description)
+            for entity_description in SPINO_BINARY_SENSORS
         )
 
 
@@ -686,3 +692,24 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         """Reevaluate after a published-state hold timer expires."""
         self._dock_access_state_reevaluate_cancel = None
         self._reevaluate_dock_access()
+
+
+class MammotionSpinoBinarySensorEntity(MammotionBaseSpinoEntity, BinarySensorEntity):
+    """Mammotion Spino pool cleaner binary sensor entity."""
+
+    entity_description: MammotionSpinoBinarySensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: MammotionSpinoCoordinator,
+        entity_description: MammotionSpinoBinarySensorEntityDescription,
+    ) -> None:
+        """Initialize the Spino binary sensor entity."""
+        super().__init__(coordinator, entity_description.key)
+        self.entity_description = entity_description
+        self._attr_translation_key = entity_description.key
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if the binary sensor is on."""
+        return self.entity_description.is_on_fn(self.coordinator.data)

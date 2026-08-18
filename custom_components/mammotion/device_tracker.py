@@ -36,6 +36,7 @@ class MammotionTracker(MammotionBaseEntity, TrackerEntity, RestoreEntity):  # ty
 
     _attr_force_update = False
     _attr_translation_key = "device_tracker"
+
     _attr_source_type = SourceType.GPS
 
     def __init__(self, coordinator: MammotionBaseUpdateCoordinator[Any]) -> None:
@@ -87,8 +88,3 @@ class MammotionTracker(MammotionBaseEntity, TrackerEntity, RestoreEntity):  # ty
         return cast(float, lon) + self.coordinator.map_offset_lon / (
             111_111.0 * cos_lat
         )
-
-    @property
-    def battery_level(self) -> int | None:
-        """Return the battery level of the device."""
-        return cast(int | None, self.coordinator.data.report_data.dev.battery_val)
